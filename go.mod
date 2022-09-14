@@ -11,3 +11,5 @@ require (
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
 	golang.org/x/net v0.0.0-20220706163947-c90051bbdb60
 )
+
+replace github.com/segmentio/kafka-go v0.4.32 => github.com/moogacs/kafka-go v0.0.1
