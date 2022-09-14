@@ -396,6 +396,7 @@ type ReaderConfig struct {
 
 	// Maximum amount of time to wait for new data to come when fetching batches
 	// of messages from kafka.
+	// if value is -1  means will not timeout waiting for new msgs to come.
 	//
 	// Default: 10s
 	MaxWait time.Duration
@@ -1497,7 +1498,12 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	r.stats.offset.observe(offset)
 
 	t0 := time.Now()
-	conn.SetReadDeadline(t0.Add(r.maxWait))
+
+	if r.maxWait == -1 {
+		conn.SetReadDeadline(time.Time{})
+	} else {
+		conn.SetReadDeadline(t0.Add(r.maxWait))
+	}
 
 	batch := conn.ReadBatchWith(ReadBatchConfig{
 		MinBytes:       r.minBytes,
