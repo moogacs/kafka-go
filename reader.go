@@ -42,6 +42,7 @@ const (
 	// polling for new messages.
 	defaultReadBackoffMin = 100 * time.Millisecond
 	defaultReadBackoffMax = 1 * time.Second
+	defaultSafetyTimeout  = 10 * time.Second
 )
 
 // Reader provides a high-level API for consuming messages from kafka.
@@ -494,6 +495,12 @@ type ReaderConfig struct {
 	// Default: 1s
 	ReadBackoffMax time.Duration
 
+	// SafetyTimeout optionally sets the maximum amount of time the reader will wait before
+	// polling for new messages
+	//
+	// Default: 10s
+	SafetyTimeout time.Duration
+
 	// If not nil, specifies a logger used to report internal changes within the
 	// reader.
 	Logger Logger
@@ -664,6 +671,10 @@ func NewReader(config ReaderConfig) *Reader {
 
 	if config.ReadBackoffMax == 0 {
 		config.ReadBackoffMax = defaultReadBackoffMax
+	}
+
+	if config.SafetyTimeout == 0 {
+		config.SafetyTimeout = defaultSafetyTimeout
 	}
 
 	if config.ReadBackoffMax < config.ReadBackoffMin {
@@ -1214,6 +1225,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 				maxWait:         r.config.MaxWait,
 				backoffDelayMin: r.config.ReadBackoffMin,
 				backoffDelayMax: r.config.ReadBackoffMax,
+				safetyTimeout:   r.config.SafetyTimeout,
 				version:         r.version,
 				msgs:            r.msgs,
 				stats:           r.stats,
@@ -1242,6 +1254,7 @@ type reader struct {
 	maxWait         time.Duration
 	backoffDelayMin time.Duration
 	backoffDelayMax time.Duration
+	safetyTimeout   time.Duration
 	version         int64
 	msgs            chan<- readerMessage
 	stats           *readerStats
@@ -1514,15 +1527,14 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	var size int64
 	var bytes int64
 
-	// const safetyTimeout = 60 * time.Second
-	// deadline := time.Now().Add(safetyTimeout)
-	// conn.SetReadDeadline(deadline)
+	deadline := time.Now().Add(r.safetyTimeout)
+	conn.SetReadDeadline(deadline)
 
 	for {
-		// if now := time.Now(); deadline.Sub(now) < (safetyTimeout / 2) {
-		// 	deadline = now.Add(safetyTimeout)
-		// 	conn.SetReadDeadline(deadline)
-		// }
+		if now := time.Now(); deadline.Sub(now) < (r.safetyTimeout / 2) {
+			deadline = now.Add(r.safetyTimeout)
+			conn.SetReadDeadline(deadline)
+		}
 
 		if msg, err = batch.ReadMessage(); err != nil {
 			batch.Close()
