@@ -673,9 +673,9 @@ func NewReader(config ReaderConfig) *Reader {
 		config.ReadBackoffMax = defaultReadBackoffMax
 	}
 
-	if config.SafetyTimeout == 0 {
-		config.SafetyTimeout = defaultSafetyTimeout
-	}
+	// if config.SafetyTimeout == 0 {
+	// 	config.SafetyTimeout = defaultSafetyTimeout
+	// }
 
 	if config.ReadBackoffMax < config.ReadBackoffMin {
 		panic(fmt.Errorf("ReadBackoffMax %d smaller than ReadBackoffMin %d", config.ReadBackoffMax, config.ReadBackoffMin))
@@ -1527,11 +1527,14 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	var size int64
 	var bytes int64
 
-	deadline := time.Now().Add(r.safetyTimeout)
-	conn.SetReadDeadline(deadline)
+	var deadline time.Time
+	if r.safetyTimeout != 0 {
+		deadline := time.Now().Add(r.safetyTimeout)
+		conn.SetReadDeadline(deadline)
+	}
 
 	for {
-		if now := time.Now(); deadline.Sub(now) < (r.safetyTimeout / 2) {
+		if now := time.Now(); deadline.Sub(now) < (r.safetyTimeout/2) && r.safetyTimeout != 0 {
 			deadline = now.Add(r.safetyTimeout)
 			conn.SetReadDeadline(deadline)
 		}
