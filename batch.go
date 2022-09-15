@@ -291,7 +291,7 @@ func (batch *Batch) readMessage(
 		// on the underlying connection are repackaged.  Otherwise, the
 		// caller can't tell the difference between a batch that was fully
 		// consumed or a batch whose connection is in an error state.
-		batch.err = dontExpectEOF(err)
+		batch.err = silentEOF(err)
 	}
 
 	return
