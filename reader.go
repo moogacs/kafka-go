@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"sort"
 	"strconv"
 	"sync"
@@ -20,7 +19,7 @@ const (
 )
 
 const (
-	// defaultCommitRetries holds the number commit attempts to make
+	// defaultCommitRetries holds the number of commit attempts to make
 	// before giving up.
 	defaultCommitRetries = 3
 )
@@ -92,8 +91,6 @@ type Reader struct {
 	// reader stats are all made of atomic values, no need for synchronization.
 	// Use a pointer to ensure 64-bit alignment of the values.
 	stats *readerStats
-
-	transport *Transport
 }
 
 // useConsumerGroup indicates whether the Reader is part of a consumer group.
@@ -241,7 +238,7 @@ func (r *Reader) commitLoopInterval(ctx context.Context, gen *Generation) {
 
 	commit := func() {
 		if err := r.commitOffsetsWithRetry(gen, offsets, defaultCommitRetries); err != nil {
-			r.withErrorLogger(func(l Logger) { l.Printf(err.Error()) })
+			r.withErrorLogger(func(l Logger) { l.Printf("%v", err) })
 		} else {
 			offsets.reset()
 		}
@@ -280,7 +277,7 @@ func (r *Reader) commitLoop(ctx context.Context, gen *Generation) {
 		l.Printf("stopped commit for group %s\n", r.config.GroupID)
 	})
 
-	if r.config.CommitInterval == 0 {
+	if r.useSyncCommits() {
 		r.commitLoopImmediate(ctx, gen)
 	} else {
 		r.commitLoopInterval(ctx, gen)
@@ -314,7 +311,7 @@ func (r *Reader) run(cg *ConsumerGroup) {
 			}
 			r.stats.errors.observe(1)
 			r.withErrorLogger(func(l Logger) {
-				l.Printf(err.Error())
+				l.Printf("%v", err)
 			})
 			// Continue with next attempt...
 		}
@@ -331,6 +328,7 @@ func (r *Reader) run(cg *ConsumerGroup) {
 		}
 
 		r.stats.rebalances.observe(1)
+
 		r.subscribe(gen.Assignments)
 
 		gen.Start(func(ctx context.Context) {
@@ -512,7 +510,7 @@ type ReaderConfig struct {
 	// non-transactional and committed records are visible.
 	IsolationLevel IsolationLevel
 
-	// Limit of how many attempts will be made before delivering the error.
+	// Limit of how many attempts to connect will be made before returning the error.
 	//
 	// The default is to try 3 times.
 	MaxAttempts int
@@ -522,9 +520,6 @@ type ReaderConfig struct {
 	// This flag is being added to retain backwards-compatibility, so it will be
 	// removed in a future version of kafka-go.
 	OffsetOutOfRangeError bool
-
-	// AllowAutoTopicCreation configures the reader to create the topics if missing.
-	AllowAutoTopicCreation bool
 }
 
 // Validate method validates ReaderConfig properties.
@@ -722,23 +717,12 @@ func NewReader(config ReaderConfig) *Reader {
 		version: version,
 	}
 	if r.useConsumerGroup() {
-
-		transport := dialerToTransport(config.Dialer, func(start time.Time) {
-			r.stats.dials.observe(1)
-			r.stats.dialTime.observe(int64(time.Since(start)))
-		})
-
-		if transport.ClientID == "" {
-			transport.ClientID = DefaultClientID
-		}
-
-		r.transport = transport
-
 		r.done = make(chan struct{})
 		r.runError = make(chan error)
 		cg, err := NewConsumerGroup(ConsumerGroupConfig{
 			ID:                     r.config.GroupID,
 			Brokers:                r.config.Brokers,
+			Dialer:                 r.config.Dialer,
 			Topics:                 r.getTopics(),
 			GroupBalancers:         r.config.GroupBalancers,
 			HeartbeatInterval:      r.config.HeartbeatInterval,
@@ -751,8 +735,6 @@ func NewReader(config ReaderConfig) *Reader {
 			StartOffset:            r.config.StartOffset,
 			Logger:                 r.config.Logger,
 			ErrorLogger:            r.config.ErrorLogger,
-			Transport:              transport,
-			AllowAutoTopicCreation: r.config.AllowAutoTopicCreation,
 		})
 		if err != nil {
 			panic(err)
@@ -790,10 +772,6 @@ func (r *Reader) Close() error {
 		close(r.msgs)
 	}
 
-	if r.transport != nil {
-		r.transport.CloseIdleConnections()
-	}
-
 	return nil
 }
 
@@ -807,17 +785,17 @@ func (r *Reader) Close() error {
 // offset when called. Note that this could result in an offset being committed
 // before the message is fully processed.
 //
-// If more fine grained control of when offsets are  committed is required, it
+// If more fine-grained control of when offsets are committed is required, it
 // is recommended to use FetchMessage with CommitMessages instead.
 func (r *Reader) ReadMessage(ctx context.Context) (Message, error) {
 	m, err := r.FetchMessage(ctx)
 	if err != nil {
-		return Message{}, err
+		return Message{}, fmt.Errorf("fetching message: %w", err)
 	}
 
 	if r.useConsumerGroup() {
 		if err := r.CommitMessages(ctx, m); err != nil {
-			return Message{}, err
+			return Message{}, fmt.Errorf("committing message: %w", err)
 		}
 	}
 
@@ -1083,12 +1061,16 @@ func (r *Reader) SetOffsetAt(ctx context.Context, t time.Time) error {
 	}
 	r.mutex.Unlock()
 
+	if len(r.config.Brokers) < 1 {
+		return errors.New("no brokers in config")
+	}
+	var conn *Conn
+	var err error
 	for _, broker := range r.config.Brokers {
-		conn, err := r.config.Dialer.DialLeader(ctx, "tcp", broker, r.config.Topic, r.config.Partition)
+		conn, err = r.config.Dialer.DialLeader(ctx, "tcp", broker, r.config.Topic, r.config.Partition)
 		if err != nil {
 			continue
 		}
-
 		deadline, _ := ctx.Deadline()
 		conn.SetDeadline(deadline)
 		offset, err := conn.ReadOffset(t)
@@ -1099,7 +1081,7 @@ func (r *Reader) SetOffsetAt(ctx context.Context, t time.Time) error {
 
 		return r.SetOffset(offset)
 	}
-	return fmt.Errorf("error setting offset for timestamp %+v", t)
+	return fmt.Errorf("error dialing all brokers, one of the errors: %w", err)
 }
 
 // Stats returns a snapshot of the reader stats since the last time the method
@@ -1238,7 +1220,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 }
 
 // A reader reads messages from kafka and produces them on its channels, it's
-// used as an way to asynchronously fetch messages while the main program reads
+// used as a way to asynchronously fetch messages while the main program reads
 // them using the high level reader API.
 type reader struct {
 	dialer           *Dialer
@@ -1364,7 +1346,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 
 			case errors.Is(err, UnknownTopicOrPartition):
 				r.withErrorLogger(func(log Logger) {
-					log.Printf("failed to read from current broker for partition %d of %s at offset %d, topic or parition not found on this broker, %v", r.partition, r.topic, toHumanOffset(offset), r.brokers)
+					log.Printf("failed to read from current broker %v for partition %d of %s at offset %d: %v", r.brokers, r.partition, r.topic, toHumanOffset(offset), err)
 				})
 
 				conn.Close()
@@ -1376,7 +1358,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 
 			case errors.Is(err, NotLeaderForPartition):
 				r.withErrorLogger(func(log Logger) {
-					log.Printf("failed to read from current broker for partition %d of %s at offset %d, not the leader", r.partition, r.topic, toHumanOffset(offset))
+					log.Printf("failed to read from current broker for partition %d of %s at offset %d: %v", r.partition, r.topic, toHumanOffset(offset), err)
 				})
 
 				conn.Close()
@@ -1390,7 +1372,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 				// Timeout on the kafka side, this can be safely retried.
 				errcount = 0
 				r.withLogger(func(log Logger) {
-					log.Printf("no messages received from kafka within the allocated time for partition %d of %s at offset %d", r.partition, r.topic, toHumanOffset(offset))
+					log.Printf("no messages received from kafka within the allocated time for partition %d of %s at offset %d: %v", r.partition, r.topic, toHumanOffset(offset), err)
 				})
 				r.stats.timeouts.observe(1)
 				continue
@@ -1616,42 +1598,6 @@ func extractTopics(members []GroupMember) []string {
 	sort.Strings(topics)
 
 	return topics
-}
-
-func dialerToTransport(kafkaDialer *Dialer, observe func(time.Time)) *Transport {
-	dialer := (&net.Dialer{
-		Timeout:       kafkaDialer.Timeout,
-		Deadline:      kafkaDialer.Deadline,
-		LocalAddr:     kafkaDialer.LocalAddr,
-		DualStack:     kafkaDialer.DualStack,
-		FallbackDelay: kafkaDialer.FallbackDelay,
-		KeepAlive:     kafkaDialer.KeepAlive,
-	})
-
-	var resolver Resolver
-	if r, ok := kafkaDialer.Resolver.(*net.Resolver); ok {
-		dialer.Resolver = r
-	} else {
-		resolver = kafkaDialer.Resolver
-	}
-
-	// For backward compatibility with the pre-0.4 APIs, support custom
-	// resolvers by wrapping the dial function.
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		start := time.Now()
-		defer observe(start)
-		address, err := lookupHost(ctx, addr, resolver)
-		if err != nil {
-			return nil, err
-		}
-		return dialer.DialContext(ctx, network, address)
-	}
-	return &Transport{
-		Dial:     dial,
-		SASL:     kafkaDialer.SASLMechanism,
-		TLS:      kafkaDialer.TLS,
-		ClientID: kafkaDialer.ClientID,
-	}
 }
 
 type humanOffset int64
